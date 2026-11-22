@@ -4,10 +4,13 @@
 // The reference reads one character at a time and builds every field up a character at a time.
 // This module reads the same way, field for field and record for record, but jumps from one
 // delimiter to the next and takes each field as a slice of the text instead of building it up.
-// The only places it goes character by character are the rare ones: a quoted field that holds
-// a doubled quote or a line break, and the junk after a closing quote. Every error, every line
-// number and every padding/cut of a ragged row follows csv-reader 1.0.0's written policy
-// exactly:
+// Most records live on one physical line with no CR inside them; those are read by a fast
+// line parser that needs only one delimiter search per field. Anything the fast parser cannot
+// prove identical — a quoted field that runs past the line's end, or a CR inside a field — is
+// handed to the general record loop below, which is also the only place that goes character by
+// character: a quoted field that holds a doubled quote or a line break, and the junk after a
+// closing quote. Every error, every line number and every padding/cut of a ragged row follows
+// csv-reader 1.0.0's written policy exactly:
 //
 //   - a U+FEFF at the very start of the text is dropped;
 //   - a record ends at LF or CRLF, and a line left with no characters is no record;
@@ -61,6 +64,11 @@ export function run(input) {
   let fValue = '';
   let fEnded = END;
   let fAdded = 0;
+  // Whether the last field the line parser read was quoted (for the no-record rule).
+  let fLastQuoted = false;
+  // The first CR at or after the last position it was computed for (-2: not yet computed,
+  // -1: none). pos never moves backwards, so this stays valid as pos advances.
+  let nextCr = -2;
 
   // Reads unquoted characters onto `value` up to the next comma or line break: a CR not followed
   // by LF is dropped (stray_cr). Sets fValue/fEnded/fAdded; `added` counts the characters kept.
@@ -225,6 +233,99 @@ export function run(input) {
     if (fAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
   }
 
+  // Tries to read the record at pos as one physical line: the text up to the next LF (or the
+  // end of the text), minus the CR of a CRLF. The caller has already established that the line
+  // holds no CR (nextCr), so no field of it can hold one either. Returns the record's fields
+  // when the line holds the whole record; returns null when it cannot prove that — a quoted
+  // field whose closing quote lies past the line's end — and the general loop then reads the
+  // record instead. On success pos and line are moved past the line and its errors are
+  // already in `errors`.
+  function tryLineRecord() {
+    const nl = text.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? n : nl;
+    let contentEnd = lineEnd;
+    if (nl !== -1 && contentEnd > pos && text.charCodeAt(contentEnd - 1) === 13) contentEnd--;
+    if (contentEnd <= pos) return null;
+    // A CR anywhere in the content is the general loop's business (a stray_cr in an
+    // unquoted field, a line break in a quoted one, junk rules after a closing quote):
+    // the first CR at or after pos decides, and the CR of a CRLF sits at contentEnd.
+    if (nextCr !== -1 && nextCr < contentEnd) return null;
+    const fields = [];
+    let pending = null;
+    let p = pos;
+    let lastQuoted = false;
+    let more = true;
+    while (more) {
+      more = false;
+      if (p < contentEnd && text.charCodeAt(p) === 34) {
+        // A quoted field that closes on this same line.
+        lastQuoted = true;
+        let q = text.indexOf('"', p + 1);
+        let doubled = false;
+        while (q !== -1 && q < contentEnd && text.charCodeAt(q + 1) === 34) {
+          doubled = true;
+          q = text.indexOf('"', q + 2);
+        }
+        if (q === -1 || q >= contentEnd) return null; // closes on a later line, or never
+        let value;
+        if (!doubled) {
+          value = text.slice(p + 1, q);
+        } else {
+          // Every quote between the pair is one of a doubled pair; collapse each to one.
+          value = '';
+          let i = p + 1;
+          while (i < q) {
+            const dq = text.indexOf('"', i);
+            if (dq === -1 || dq >= q) {
+              value += text.slice(i, q);
+              break;
+            }
+            value += text.slice(i, dq) + '"';
+            i = dq + 2;
+          }
+        }
+        const after = q + 1;
+        if (after >= contentEnd) {
+          fields.push(value);
+        } else if (text.charCodeAt(after) === 44) {
+          fields.push(value);
+          p = after + 1;
+          more = true;
+        } else {
+          // Junk after the closing quote, up to the next comma or the line's end.
+          let junkEnd = text.indexOf(',', after);
+          if (junkEnd === -1 || junkEnd > contentEnd) junkEnd = contentEnd;
+          const junk = text.slice(after, junkEnd);
+          if (junk.length > 0) {
+            if (pending === null) pending = [];
+            pending.push({ code: 'quote_junk', line: recordLine, row: recordRow });
+          }
+          fields.push(value + junk);
+          if (junkEnd < contentEnd) {
+            p = junkEnd + 1;
+            more = true;
+          }
+        }
+      } else {
+        // An unquoted field: up to the next comma or the line's end. A quote inside it is a
+        // literal character, so only the comma is searched for.
+        lastQuoted = false;
+        let d = text.indexOf(',', p);
+        if (d === -1 || d > contentEnd) d = contentEnd;
+        fields.push(text.slice(p, d));
+        if (d < contentEnd) {
+          p = d + 1;
+          more = true;
+        }
+      }
+    }
+    if (pending !== null) for (const e of pending) errors.push(e);
+    pos = nl === -1 ? n : nl + 1;
+    if (nl !== -1) line += 1;
+    fLastQuoted = lastQuoted;
+    return fields;
+  }
+
   while (true) {
     // Lines with no characters are no records.
     while (pos < n) {
@@ -243,6 +344,31 @@ export function run(input) {
 
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
+
+    if (nextCr !== -1 && nextCr < pos) nextCr = text.indexOf('\r', pos);
+    const fast = tryLineRecord();
+    if (fast !== null) {
+      // The record tail, the same steps as at the end of the general loop below. It is kept
+      // inline in both places on purpose: passing the fields array to a shared helper makes
+      // V8's garbage collector work far harder on this allocation-heavy loop (measured:
+      // ~15x the GC pause over the practice set), for no change in output.
+      if (!(fast.length === 1 && fast[0] === '' && !fLastQuoted)) {
+        if (width < 0) width = fast.length;
+        if (header && columns === null) {
+          columns = fast;
+        } else {
+          if (fast.length < width) {
+            errors.push({ code: 'short_row', line: recordLine, row: recordRow, fields: fast.length });
+            while (fast.length < width) fast.push('');
+          } else if (fast.length > width) {
+            errors.push({ code: 'long_row', line: recordLine, row: recordRow, extra: fast.splice(width) });
+          }
+          rows.push(fast);
+        }
+      }
+      continue;
+    }
+
     const fields = [];
     let quoted;
     do {
